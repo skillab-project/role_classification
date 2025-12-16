@@ -10,7 +10,10 @@ import shap
 # ------------------------------------------------------------
 # INITIAL SETUP
 # ------------------------------------------------------------
-app = FastAPI(title="SkillLab Job Classifier API")
+app = FastAPI(
+    title="SkillLab Job Classifier API",
+    root_path="/role-classification"
+)
 
 analysis_router = APIRouter(
     prefix="/api/analysis",
