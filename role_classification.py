@@ -1095,7 +1095,6 @@ def train_job_emerging_classifier(
         "jobs_used": len(jobs),
         "skills_dim": len(SKILL_INDEX),
         "positive_label_ratio": float(np.mean(y)),
-        "job_diagnostics": results,
         "descriptive_statistics": descriptive_stats,
         "global_top_emerging_skills": global_top_emerging,
         "global_top_established_skills": global_top_established
@@ -1107,3 +1106,4 @@ def train_job_emerging_classifier(
 # REGISTER ROUTER
 # ------------------------------------------------------------
 app.include_router(analysis_router)
+
