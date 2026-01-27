@@ -40,6 +40,16 @@ pipeline {
             }
         }
 
+        // ********************************
+        // *** INTEGRATION TESTS ***
+        // ********************************
+        stage("Run Integration Tests") {
+            steps {
+                echo "***** Run Integration Tests *****"
+                sh "docker compose run --rm role-classification python -m pytest tests/test_integration.py"
+            }
+        }
+
         // ****************************
         // *** Push Images In Harbor ***
         // ****************************
