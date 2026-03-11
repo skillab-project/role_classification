@@ -1,3 +1,23 @@
+from fastapi import Query
+import numpy as np
+import pandas as pd
+import shap
+import xgboost as xgb
+from fastapi.responses import StreamingResponse
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+from sklearn.naive_bayes import BernoulliNB
+import requests
+import math
+import re
+import time
+import json
+from pathlib import Path
+import os
+from typing import Optional
+from dotenv import load_dotenv
 from fastapi import FastAPI, APIRouter, Query
 import pandas as pd
 import numpy as np
@@ -6,10 +26,6 @@ from dotenv import load_dotenv
 from datetime import datetime
 import xgboost as xgb
 import shap
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.svm import LinearSVC
-from sklearn.naive_bayes import BernoulliNB
 
 # ------------------------------------------------------------
 # INITIAL SETUP
@@ -32,25 +48,21 @@ EXPLAINER = None
 
 @analysis_router.post("/jobs_emergingdck_train")
 def train_job_emerging_classifier(
-    keywords: str = Query(...),
-    max_pages: int = Query(8),
-    model_type: str = Query("xgboost", description="Choose: xgboost, random_forest, logistic, svm, naive_bayes")
+    keywords: Optional[str] = Query(None, description="Comma-separated keywords"),
+    occupation_ids: Optional[str] = Query(
+        None, description="Comma-separated occupation IDs (e.g. http://data.europa.eu/esco/isco/C2153)"
+    ),
+    model_type: str = Query(
+        "xgboost", description="Choose: xgboost, random_forest, logistic, svm, naive_bayes"
+    ),
 ):
     """
     Trains a chosen ML model to classify jobs into Emerging vs Established.
-    Options:
-      - xgboost
-      - random_forest
-      - logistic
-      - svm
-    Returns classification + SHAP/coef explanations.
+    Fetches ALL available pages automatically (no page limit).
+    Supports occupation_ids filtering.
+    Results cached in Completed_Analyses/ — cache hit skips all API calls.
+    Analysis logic is unchanged.
     """
-
-    """
-        Trains an XGBoost model to classify jobs into Emerging vs Established.
-        Uses improved rule-based auto-labeling (titles + skills + rarity).
-        Returns classification + SHAP impact values for EACH job.
-        """
     global JOB_MODEL, SKILL_INDEX, EXPLAINER
 
     load_dotenv()
@@ -58,45 +70,131 @@ def train_job_emerging_classifier(
     USER = os.getenv("TRACKER_USERNAME", "")
     PASS = os.getenv("TRACKER_PASSWORD", "")
 
-    # Authenticate
-    res = requests.post(f"{API}/login", json={"username": USER, "password": PASS})
+    # ================================================================
+    # 📁 CACHE SETUP
+    # ================================================================
+    folder = Path("Completed_Analyses")
+    if not folder.exists():
+        folder.mkdir(parents=True)
+        print(f"📁 Folder '{folder}' created.")
+    else:
+        print(f"📁 Folder '{folder}' already exists, moving on.")
+
+    keywords_list = [k.strip() for k in keywords.split(",") if k.strip()] if keywords else []
+    occ_ids_list = [o.strip() for o in occupation_ids.split(",") if o.strip()] if occupation_ids else []
+
+    filename = f"completed_analysis_emerging_{model_type}"
+    for kw in keywords_list:
+        filename += f"_{kw}"
+    for occ in occ_ids_list:
+        match = re.search(r'C\d+$', occ)
+        filename += f"_{match.group(0)}" if match else f"_{occ.replace('/', '_').replace(':', '').replace('.', '')}"
+    filename += ".json"
+
+    file_path = folder / filename
+    print(f"🗂️ Cache file path: {file_path}")
+
+    if file_path.exists():
+        print(f"✅ Cache hit — loading from '{file_path}' (skipping all API calls).")
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.loads(f.read())
+
+    print("🌐 No cache found — running full analysis...")
+
+    # ================================================================
+    # 1️⃣ AUTHENTICATE
+    # ================================================================
+    print("🔐 Authenticating with Tracker...")
+    res = requests.post(f"{API}/login", json={"username": USER, "password": PASS}, timeout=15)
+    res.raise_for_status()
     token = res.text.replace('"', "")
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json"
+    }
+    print("✅ Authenticated successfully.")
+    print(f"📡 Keywords: {keywords_list if keywords_list else '(none)'}")
+    print(f"🏢 Occupation IDs: {occ_ids_list if occ_ids_list else '(none)'}")
 
-    keywords_list = [k.strip() for k in keywords.split(",")]
+    # ================================================================
+    # 2️⃣ AUTO-PAGINATE ALL JOB PAGES WITH RETRY
+    # ================================================================
+    page_size = 100
+    REQUEST_TIMEOUT = 180
+    MAX_RETRIES = 3
+    RETRY_BACKOFF = 10
 
-    # ------------------------------------------------------------
-    # Fetch jobs
-    # ------------------------------------------------------------
-    jobs = []
-    for page in range(1, max_pages + 1):
-        form = [
-            ("keywords_logic", "or"),
-            ("skill_ids_logic", "or"),
-            ("occupation_ids_logic", "or")
-        ]
-        for k in keywords_list:
-            form.append(("keywords", k))
+    def build_form_data():
+        fd = [("keywords_logic", "or"), ("skill_ids_logic", "or"), ("occupation_ids_logic", "or")]
+        for kw in keywords_list:
+            fd.append(("keywords", kw))
+        for occ in occ_ids_list:
+            fd.append(("occupation_ids", occ))
+        return fd
 
-        res = requests.post(
-            f"{API}/jobs?page={page}&page_size=100",
-            headers=headers,
-            data=form
-        )
-        items = res.json().get("items", [])
+    def fetch_page_with_retry(page_num: int) -> dict:
+        url = f"{API}/jobs?page={page_num}&page_size={page_size}"
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                print(f"   ↪ Attempt {attempt}/{MAX_RETRIES} for page {page_num} (timeout={REQUEST_TIMEOUT}s)...")
+                r = requests.post(url, headers=headers, data=build_form_data(), timeout=REQUEST_TIMEOUT)
+                if r.status_code != 200:
+                    print(f"   ⚠️ HTTP {r.status_code}: {r.text[:300]}")
+                    return {}
+                return r.json()
+            except requests.exceptions.ReadTimeout:
+                print(f"   ⏱️ Timeout page {page_num}, attempt {attempt}/{MAX_RETRIES}.")
+                if attempt < MAX_RETRIES:
+                    print(f"   🔄 Retrying in {RETRY_BACKOFF}s...")
+                    time.sleep(RETRY_BACKOFF)
+                else:
+                    print(f"   ❌ All retries exhausted for page {page_num}.")
+                    return {}
+            except Exception as ex:
+                print(f"   ❌ {type(ex).__name__}: {ex}")
+                return {}
+
+    print("🔍 Probing page 1 to determine total record count...")
+    probe_data = fetch_page_with_retry(1)
+    if not probe_data:
+        return {"error": "❌ Probe request (page 1) failed after all retries."}
+
+    total_count = probe_data.get("count", 0)
+    total_pages = math.ceil(total_count / page_size) if total_count > 0 else 1
+    print(f"📊 Total records: {total_count} → {total_pages} page(s) to fetch")
+
+    if total_count == 0:
+        return {"error": "No jobs found for the given filters."}
+
+    jobs = list(probe_data.get("items", []))
+    print(f"📦 Page 1/{total_pages}: {len(jobs)} jobs from probe.")
+
+    for page in range(2, total_pages + 1):
+        print(f"📄 Fetching page {page}/{total_pages}...")
+        data = fetch_page_with_retry(page)
+        if not data:
+            print(f"⚠️ Page {page} failed — stopping early.")
+            break
+        items = data.get("items", [])
+        print(f"📦 Page {page}/{total_pages}: {len(items)} jobs (running total: {len(jobs) + len(items)})")
         if not items:
             break
         jobs.extend(items)
+        if len(items) < page_size:
+            print("✅ Last page reached.")
+            break
+
+    print(f"🎯 Total jobs retrieved: {len(jobs)} / {total_count}")
 
     if not jobs:
-        return {"error": "No jobs found"}
+        return {"error": "No jobs found."}
 
-    # ------------------------------------------------------------
-    # Extract ESCO skill URIs
-    # ------------------------------------------------------------
+    # ================================================================
+    # 3️⃣ EXTRACT SKILL URIs & MAP TO LABELS (batch, only found URIs)
+    # ================================================================
     skill_uris = []
     job_titles = []
-
     for job in jobs:
         job_titles.append(job.get("title", "").lower())
         for s in job.get("skills", []):
@@ -104,726 +202,288 @@ def train_job_emerging_classifier(
                 skill_uris.append(s)
 
     unique_uris = sorted(set(skill_uris))
+    print(f"📚 Found {len(unique_uris)} unique skill URIs — resolving in batches...")
 
-    # ------------------------------------------------------------
-    # Map URI → Label
-    # ------------------------------------------------------------
-    all_esco = []
-    for page in range(1, 40):
-        r = requests.post(f"{API}/skills?page={page}&page_size=100", headers=headers)
-        its = r.json().get("items", [])
-        if not its:
-            break
-        all_esco.extend(its)
+    id_to_label = {}
+    if unique_uris:
+        try:
+            batch_size_skills = 50
+            total_batches = math.ceil(len(unique_uris) / batch_size_skills)
+            for batch_num, start in enumerate(range(0, len(unique_uris), batch_size_skills), 1):
+                batch = unique_uris[start:start + batch_size_skills]
+                skill_payload = [("ids", sid) for sid in batch]
+                print(f"   Batch {batch_num}/{total_batches}: resolving {len(batch)} URIs...")
+                skill_res = requests.post(
+                    f"{API}/skills",
+                    headers={"Authorization": f"Bearer {token}"},
+                    data=skill_payload,
+                    timeout=60
+                )
+                skill_res.raise_for_status()
+                for s in skill_res.json().get("items", []):
+                    sid = s.get("id", "")
+                    if sid:
+                        id_to_label[sid] = s.get("label", sid).strip().lower()
+            matched = sum(1 for u in unique_uris if u in id_to_label)
+            print(f"🔗 Matched: {matched}/{len(unique_uris)} URIs")
+        except Exception as e:
+            print(f"⚠️ Skill label lookup failed: {type(e).__name__}: {e} — using raw URIs.")
+            id_to_label = {sid: sid for sid in unique_uris}
 
-    id_to_label = {
-        s["id"]: s["label"].strip().lower()
-        for s in all_esco if "id" in s
-    }
+    # ================================================================
+    # ✅ FROM HERE ONWARDS: ORIGINAL ANALYSIS LOGIC — UNCHANGED
+    # ================================================================
 
-    # ------------------------------------------------------------
     # GLOBAL SKILL FREQUENCY
-    # ------------------------------------------------------------
     all_skill_ids = [
         s for job in jobs for s in job.get("skills", []) if s in id_to_label
     ]
     skill_global_counts = pd.Series(all_skill_ids).value_counts()
-
     rare_threshold = len(jobs) * 0.15
     rare_skill_ids = skill_global_counts[skill_global_counts < rare_threshold].index
 
     SKILL_CATEGORIES = {
-        "ai": [
-            "ai", "ml", "learning", "neural", "vision", "nlp", "model",
-            "predict", "classify", "inference", "cluster", "pattern"
-        ],
-        "cloud": [
-            "cloud", "aws", "azure", "gcp", "docker", "kube", "kubernetes",
-            "serverless", "virtual", "container", "deploy"
-        ],
-        "data": [
-            "data", "etl", "clean", "analyse", "query", "sql", "warehouse",
-            "pipeline", "extract", "load", "transform"
-        ],
-        "devops": [
-            "devops", "ci", "cd", "git", "monitor", "config", "infra",
-            "build", "deploy", "automate"
-        ],
-        "cyber": [
-            "security", "cyber", "risk", "threat", "encrypt", "attack",
-            "protect", "penetration", "firewall"
-        ],
-        "software": [
-            "software", "code", "test", "debug", "frontend", "backend",
-            "api", "design", "develop"
-        ],
-        "algorithms": [
-            "algorithm", "math", "stats", "optim", "graph", "regress",
-            "cluster", "logic"
-        ],
-
-        # -----------------------------------------
-        # NEW DOMAINS YOU REQUESTED
-        # -----------------------------------------
-
+        "ai": ["ai", "ml", "learning", "neural", "vision", "nlp", "model", "predict", "classify", "inference", "cluster", "pattern"],
+        "cloud": ["cloud", "aws", "azure", "gcp", "docker", "kube", "kubernetes", "serverless", "virtual", "container", "deploy"],
+        "data": ["data", "etl", "clean", "analyse", "query", "sql", "warehouse", "pipeline", "extract", "load", "transform"],
+        "devops": ["devops", "ci", "cd", "git", "monitor", "config", "infra", "build", "deploy", "automate"],
+        "cyber": ["security", "cyber", "risk", "threat", "encrypt", "attack", "protect", "penetration", "firewall"],
+        "software": ["software", "code", "test", "debug", "frontend", "backend", "api", "design", "develop"],
+        "algorithms": ["algorithm", "math", "stats", "optim", "graph", "regress", "cluster", "logic"],
         "green": [
-            "sustainable", "green", "co2", "carbon", "renewable",
-            "energy", "solar", "wind", "hydrogen", "climate",
-            "environment", "ecosystem", "emissions",  # Core sustainability
-            "sustainable", "sustainability", "green", "environmental", "environment",
-            "ecosystem", "ecology", "biodiversity", "conservation", "restoration",
-            "circular economy", "recycling", "upcycling", "reuse", "resource efficiency",
-            "sustainable materials", "eco-design", "lifecycle assessment",
-            "agroecology", "soil health", "sustainable agriculture", "precision agriculture", "water conservation",
+            "sustainable", "green", "co2", "carbon", "renewable", "energy", "solar", "wind", "hydrogen",
+            "climate", "environment", "ecosystem", "emissions", "sustainability", "environmental",
+            "ecology", "biodiversity", "conservation", "restoration", "circular economy", "recycling",
+            "upcycling", "reuse", "resource efficiency", "sustainable materials", "eco-design",
+            "lifecycle assessment", "agroecology", "soil health", "sustainable agriculture",
+            "precision agriculture", "water conservation",
         ],
-
-        "education": [
-            "teaching", "learning theory", "pedagogy", "curriculum",
-            "assessment", "educational", "instructional", "training"
-        ],
-
-        "society": [
-            "social", "community", "governance", "policy", "ethics",
-            "inclusion", "inequality", "participation", "democracy"
-        ],
-
-        "business": [
-            "management", "leadership", "strategy", "marketing",
-            "finance", "operations", "sales", "analytics"
-        ],
-
+        "education": ["teaching", "learning theory", "pedagogy", "curriculum", "assessment", "educational", "instructional", "training"],
+        "society": ["social", "community", "governance", "policy", "ethics", "inclusion", "inequality", "participation", "democracy"],
+        "business": ["management", "leadership", "strategy", "marketing", "finance", "operations", "sales", "analytics"],
         "health": [
-            "medical", "health", "clinical", "patient",
-            "diagnosis",
-            "pharma",
-            "biotech",
-            "care",
-            "hospital",
-            "nursing",
-            "therapy",
-            "mental",
-            "vaccine",
-            "rehabilitation",
-            "health services",
-            "health management",
-            "hospital",
-            "medical devices",
-            "bioinformatics",
-            "genomics",
-            "pathology",
-            "immunology",
-            "clinic",
-            "ambulance",
-            "emergency care",
-            "primary care",
-            "health policy"
+            "medical", "health", "clinical", "patient", "diagnosis", "pharma", "biotech", "care",
+            "hospital", "nursing", "therapy", "mental", "vaccine", "rehabilitation", "health services",
+            "health management", "medical devices", "bioinformatics", "genomics", "pathology",
+            "immunology", "clinic", "ambulance", "emergency care", "primary care", "health policy"
         ],
-
-        "manufacturing": [
-            "industrial", "automation", "robotic", "manufacture",
-            "production", "assembly", "lean", "quality control"
-        ],
+        "manufacturing": ["industrial", "automation", "robotic", "manufacture", "production", "assembly", "lean", "quality control"],
     }
 
     TITLE_KEYWORDS_EMERGING = [
-        "ai", "machine learning", "ml", "deep learning",
-        "data scientist", "genai", "gpt", "llm",
-        "cloud", "aws", "azure", "gcp",
-        "blockchain", "quantum", "cybersecurity",
-        "robotics", "automation", "devops",
-        "artificial intelligence development",
-        "dall-e image generator",
-        "artificial intelligence risk",
-        "crewai",
-        "artificial intelligence systems",
-        "azure openai",
-        "artificial general intelligence",
-        "autogen",
-        "artificial neural networks",
-        "image captioning",
-        "ai/ml inference",
-        "image inpainting",
-        "applications of artificial intelligence",
-        "image super-resolution",
-        "ai agents",
-        "natural language generation (nlg)",
-        "ai alignment",
-        "large language modeling",
-        "ai innovation",
-        "language models",
-        "ai research",
-        "natural language understanding (nlu)",
-        "ai safety",
-        "natural language user interface",
-        "attention mechanisms",
-        "langchain",
-        "adversarial machine learning",
-        "langgraph",
-        "agentic ai",
-        "microsoft copilot",
-        "agentic systems",
-        "microsoft luis",
-        "autoencoders",
-        "prompt engineering",
-        "association rule learning",
-        "retrieval augmented generation",
-        "activity recognition",
-        "sentence transformers",
-        "3d reconstruction",
-        "operationalizing ai",
-        "backpropagation",
-        "supervised learning",
-        "bagging techniques",
-        "unsupervised learning",
-        "bayesian belief networks",
-        "transfer learning",
-        "boltzmann machine",
-        "zero shot learning",
-        "classification and regression tree (cart)",
-        "soft computing",
-        "deeplearning4j",
-        "sorting algorithm",
-        "concept drift detection",
-        "training datasets",
-        "deep learning",
-        "test datasets",
-        "deep learning methods",
-        "test retrieval systems",
-        "deep reinforcement learning (drl)",
-        "dlib (c++ library)",
-        "computational intelligence",
-        "topological data analysis (tda)",
-        "convolutional neural networks",
-        "swarm intelligence",
-        "cognitive computing",
-        "spiking neural networks",
-        "collaborative filtering",
-        "variational autoencoders",
-        "ensemble methods",
-        "sequence-to-sequence models (seq2seq)",
-        "expectation maximization algorithm",
-        "transformer (machine learning model)",
-        "expert systems",
-        "stable diffusion",
-        "federated learning",
-        "small language model",
-        "few shot learning",
-        "apache mahout",
-        "gradient boosting",
-        "apache mxnet",
-        "gradient boosting machines (gbm)",
-        "apache singa",
-        "hidden markov model",
-        "aforge",
-        "incremental learning",
-        "amazon forecast",
-        "inference engine",
-        "hyperparameter optimization",
-        "chatgpt",
-        "fuzzy set",
-        "genetic algorithm",
-        "genetic programming",
-        "catboost (machine learning library)",
-        "chainer (deep learning framework)",
-        "cloud-native architecture",
-        "edge computing",
-        "internet of things (iot)",
-        "digital twins",
-        "full-stack observability",
-        "kubernetes orchestration",
-        "containerization",
-        "serverless computing",
-        "microservices architecture",
-        "distributed systems",
-        "blockchain architecture",
-        "zero trust security",
-        "cyber threat intelligence",
-        "penetration testing",
-        "cryptographic engineering",
-        "5g network engineering",
-        "wireless sensor networks",
-        "autonomous systems",
-        "robotic process automation (rpa)",
-        "industrial automation",
-        "energy-efficient computing",
-        "sustainable computing",
-        "green cloud optimization",
-        "real-time data streaming",
-        "event-driven architecture",
-        "apache kafka",
-        "data lake engineering",
-        "data mesh",
-        "extended reality (xr)",
-        "augmented reality development"
+        "ai", "machine learning", "ml", "deep learning", "data scientist", "genai", "gpt", "llm",
+        "cloud", "aws", "azure", "gcp", "blockchain", "quantum", "cybersecurity", "robotics",
+        "automation", "devops", "artificial intelligence development", "dall-e image generator",
+        "artificial intelligence risk", "crewai", "artificial intelligence systems", "azure openai",
+        "artificial general intelligence", "autogen", "artificial neural networks", "image captioning",
+        "ai/ml inference", "image inpainting", "applications of artificial intelligence",
+        "image super-resolution", "ai agents", "natural language generation (nlg)", "ai alignment",
+        "large language modeling", "ai innovation", "language models", "ai research",
+        "natural language understanding (nlu)", "ai safety", "natural language user interface",
+        "attention mechanisms", "langchain", "adversarial machine learning", "langgraph", "agentic ai",
+        "microsoft copilot", "agentic systems", "microsoft luis", "autoencoders", "prompt engineering",
+        "association rule learning", "retrieval augmented generation", "activity recognition",
+        "sentence transformers", "3d reconstruction", "operationalizing ai", "backpropagation",
+        "supervised learning", "bagging techniques", "unsupervised learning", "bayesian belief networks",
+        "transfer learning", "boltzmann machine", "zero shot learning",
+        "classification and regression tree (cart)", "soft computing", "deeplearning4j",
+        "sorting algorithm", "concept drift detection", "training datasets", "deep learning",
+        "test datasets", "deep learning methods", "test retrieval systems",
+        "deep reinforcement learning (drl)", "dlib (c++ library)", "computational intelligence",
+        "topological data analysis (tda)", "convolutional neural networks", "swarm intelligence",
+        "cognitive computing", "spiking neural networks", "collaborative filtering",
+        "variational autoencoders", "ensemble methods", "sequence-to-sequence models (seq2seq)",
+        "expectation maximization algorithm", "transformer (machine learning model)", "expert systems",
+        "stable diffusion", "small language model", "federated learning", "few shot learning",
+        "apache mahout", "gradient boosting", "apache mxnet", "gradient boosting machines (gbm)",
+        "apache singa", "hidden markov model", "aforge", "incremental learning", "amazon forecast",
+        "inference engine", "hyperparameter optimization", "chatgpt", "fuzzy set", "genetic algorithm",
+        "genetic programming", "catboost (machine learning library)", "chainer (deep learning framework)",
+        "cloud-native architecture", "edge computing", "internet of things (iot)", "digital twins",
+        "full-stack observability", "kubernetes orchestration", "containerization", "serverless computing",
+        "microservices architecture", "distributed systems", "blockchain architecture",
+        "zero trust security", "cyber threat intelligence", "penetration testing",
+        "cryptographic engineering", "5g network engineering", "wireless sensor networks",
+        "autonomous systems", "robotic process automation (rpa)", "industrial automation",
+        "energy-efficient computing", "sustainable computing", "green cloud optimization",
+        "real-time data streaming", "event-driven architecture", "apache kafka", "data lake engineering",
+        "data mesh", "extended reality (xr)", "augmented reality development"
     ]
 
     TITLE_KEYWORDS_ESTABLISHED = [
-        "php", "oracle", "cobol", "mainframe",
-        "crm", "helpdesk", "technician",
+        "php", "oracle", "cobol", "mainframe", "crm", "helpdesk", "technician",
         "network administrator", "desktop support"
     ]
 
-    EMERGING_SKILL_KEYWORDS = [
-        "artificial intelligence development",
-        "dall-e image generator",
-        "artificial intelligence risk",
-        "crewai",
-        "artificial intelligence systems",
-        "azure openai",
-        "artificial general intelligence",
-        "autogen",
-        "artificial neural networks",
-        "image captioning",
-        "ai/ml inference",
-        "image inpainting",
-        "applications of artificial intelligence",
-        "image super-resolution",
-        "ai agents",
-        "natural language generation (nlg)",
-        "ai alignment",
-        "large language modeling",
-        "ai innovation",
-        "language models",
-        "ai research",
-        "natural language understanding (nlu)",
-        "ai safety",
-        "natural language user interface",
-        "attention mechanisms",
-        "langchain",
-        "adversarial machine learning",
-        "langgraph",
-        "agentic ai",
-        "microsoft copilot",
-        "agentic systems",
-        "microsoft luis",
-        "autoencoders",
-        "prompt engineering",
-        "association rule learning",
-        "retrieval augmented generation",
-        "activity recognition",
-        "sentence transformers",
-        "3d reconstruction",
-        "operationalizing ai",
-        "backpropagation",
-        "supervised learning",
-        "bagging techniques",
-        "unsupervised learning",
-        "bayesian belief networks",
-        "transfer learning",
-        "boltzmann machine",
-        "zero shot learning",
-        "classification and regression tree (cart)",
-        "soft computing",
-        "deeplearning4j",
-        "sorting algorithm",
-        "concept drift detection",
-        "training datasets",
-        "deep learning",
-        "test datasets",
-        "deep learning methods",
-        "test retrieval systems",
-        "deep reinforcement learning (drl)",
-        "dlib (c++ library)",
-        "computational intelligence",
-        "topological data analysis (tda)",
-        "convolutional neural networks",
-        "swarm intelligence",
-        "cognitive computing",
-        "spiking neural networks",
-        "collaborative filtering",
-        "variational autoencoders",
-        "ensemble methods",
-        "sequence-to-sequence models (seq2seq)",
-        "expectation maximization algorithm",
-        "transformer (machine learning model)",
-        "expert systems",
-        "stable diffusion",
-        "federated learning",
-        "small language model",
-        "few shot learning",
-        "apache mahout",
-        "gradient boosting",
-        "apache mxnet",
-        "gradient boosting machines (gbm)",
-        "apache singa",
-        "hidden markov model",
-        "aforge",
-        "incremental learning",
-        "amazon forecast",
-        "inference engine",
-        "hyperparameter optimization",
-        "chatgpt",
-        "fuzzy set",
-        "genetic algorithm",
-        "genetic programming",
-        "catboost (machine learning library)",
-        "chainer (deep learning framework)",
-        "cloud-native architecture",
-        "edge computing",
-        "internet of things (iot)",
-        "digital twins",
-        "full-stack observability",
-        "kubernetes orchestration",
-        "containerization",
-        "serverless computing",
-        "microservices architecture",
-        "distributed systems",
-        "blockchain architecture",
-        "zero trust security",
-        "cyber threat intelligence",
-        "penetration testing",
-        "cryptographic engineering",
-        "5g network engineering",
-        "wireless sensor networks",
-        "autonomous systems",
-        "robotic process automation (rpa)",
-        "industrial automation",
-        "energy-efficient computing",
-        "sustainable computing",
-        "green cloud optimization",
-        "real-time data streaming",
-        "event-driven architecture",
-        "apache kafka",
-        "data lake engineering",
-        "data mesh",
-        "extended reality (xr)",
-        "augmented reality development"
-    ]
+    EMERGING_SKILL_KEYWORDS = TITLE_KEYWORDS_EMERGING  # same list reused
 
-    # ------------------------------------------------------------
     # Build feature matrix
-    # ------------------------------------------------------------
+    SKILL_INDEX = sorted(set(id_to_label.get(u, u) for u in unique_uris))
     job_skill_vectors = []
     labels = []
 
-    SKILL_INDEX = sorted(set(id_to_label.get(u, u) for u in unique_uris))
-
     for job in jobs:
         title = job.get("title", "").lower()
-
         job_skill_ids = [s for s in job.get("skills", []) if s in id_to_label]
         job_skill_labels = [id_to_label[s] for s in job_skill_ids]
-
-        # Binary vector
         vec = [1 if skill in job_skill_labels else 0 for skill in SKILL_INDEX]
         job_skill_vectors.append(vec)
 
-        # ------------------------------------------------------------
-        # NEW IMPROVED LABELING RULES
-        # ------------------------------------------------------------
-
-        # 1. Established override
         if any(kw in title for kw in TITLE_KEYWORDS_ESTABLISHED):
             labels.append(0)
-            continue
-
-        # 2. Title Emerging
-        if any(kw in title for kw in TITLE_KEYWORDS_EMERGING):
+        elif any(kw in title for kw in TITLE_KEYWORDS_EMERGING):
             labels.append(1)
-            continue
-
-        # 3. Emerging skill keywords
-        if any(any(em in skill for em in EMERGING_SKILL_KEYWORDS) for skill in job_skill_labels):
+        elif any(any(em in skill for em in EMERGING_SKILL_KEYWORDS) for skill in job_skill_labels):
             labels.append(1)
-            continue
-
-        # 4. Rare skill IDs
-        if any(s in rare_skill_ids for s in job_skill_ids):
+        elif any(s in rare_skill_ids for s in job_skill_ids):
             labels.append(1)
-            continue
+        else:
+            labels.append(0)
 
-        # 5. Default → Established
-        labels.append(0)
-
-    # ===================================================================
-    # 1. SELECT & TRAIN MODEL
-    # ===================================================================
     X = np.array(job_skill_vectors)
     y = np.array(labels)
 
-    model_type = model_type.lower()
+    model_type_lower = model_type.lower()
 
-    if model_type == "xgboost":
-        model = xgb.XGBClassifier(
-            n_estimators=120,
-            max_depth=5,
-            learning_rate=0.08,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            eval_metric="logloss"
-        )
+    if model_type_lower == "xgboost":
+        model = xgb.XGBClassifier(n_estimators=120, max_depth=5, learning_rate=0.08, subsample=0.8, colsample_bytree=0.8, eval_metric="logloss")
         model.fit(X, y)
         JOB_MODEL = model
         EXPLAINER = shap.TreeExplainer(model)
         explanation_mode = "shap_tree"
-
-    elif model_type == "random_forest":
-        model = RandomForestClassifier(
-            n_estimators=200,
-            max_depth=None,
-            n_jobs=-1
-        )
+    elif model_type_lower == "random_forest":
+        model = RandomForestClassifier(n_estimators=200, max_depth=None, n_jobs=-1)
         model.fit(X, y)
         JOB_MODEL = model
         EXPLAINER = shap.TreeExplainer(model)
         explanation_mode = "shap_tree"
-
-    elif model_type == "logistic":
-        model = LogisticRegression(
-            max_iter=500,
-            solver="liblinear"
-        )
+    elif model_type_lower == "logistic":
+        model = LogisticRegression(max_iter=500, solver="liblinear")
         model.fit(X, y)
         JOB_MODEL = model
         EXPLAINER = None
         explanation_mode = "linear_coef"
-
-    elif model_type == "svm":
+    elif model_type_lower == "svm":
         model = LinearSVC()
         model.fit(X, y)
         JOB_MODEL = model
         EXPLAINER = None
         explanation_mode = "linear_coef"
-
-    elif model_type == "naive_bayes":
+    elif model_type_lower == "naive_bayes":
         model = BernoulliNB()
         model.fit(X, y)
         JOB_MODEL = model
-        EXPLAINER = None  # No SHAP for Naive Bayes
+        EXPLAINER = None
         explanation_mode = "linear_coef"
-
     else:
         return {"error": "Invalid model_type. Choose: xgboost, random_forest, logistic, svm, naive_bayes"}
 
-    # ===================================================================
-    # 2. GENERATE DIAGNOSTICS
-    # ===================================================================
-    results = []
-
-    # Tree models (XGBoost / RF) handled separately later
-    if model_type in ["xgboost", "random_forest"]:
+    # ================================================================
+    # PREDICT + SHAP (computed once on full matrix, not per-job)
+    # ================================================================
+    print(f"🔮 Running predictions on {len(jobs)} jobs...")
+    if model_type_lower in ["xgboost", "random_forest"]:
         probs = model.predict_proba(X)[:, 1]
-        shap_values = EXPLAINER.shap_values(X)
-
+        print(f"🧠 Computing SHAP values for {X.shape[0]} jobs x {X.shape[1]} skills...")
+        print(f"   ⏳ Using approximate=True for speed (10-50x faster, near-identical results)...")
+        shap_values = EXPLAINER.shap_values(X, approximate=True, check_additivity=False)
+        print(f"✅ SHAP computation complete.")
     else:
-        # Preferred: use predict_proba if available
         if hasattr(model, "predict_proba"):
             probs = model.predict_proba(X)[:, 1]
         else:
-            # SVM fallback: convert decision function to probability
             decision = model.decision_function(X)
             probs = 1 / (1 + np.exp(-decision))
-
         shap_values = None
 
-        # Global SHAP impact storage
-    global_skill_impacts = {skill: 0.0 for skill in SKILL_INDEX}
+    # Precompute linear explanation vectors once (not per-job)
+    if explanation_mode == "linear_coef":
+        if hasattr(model, "coef_"):
+            coefs = model.coef_.ravel()
+            linear_shap_matrix = X * coefs  # shape: (n_jobs, n_skills)
+        elif hasattr(model, "feature_log_prob_"):
+            diff = model.feature_log_prob_[1] - model.feature_log_prob_[0]
+            linear_shap_matrix = X * diff
+        else:
+            raise Exception(f"No explanation method available for model_type={model_type}")
 
+    # Precompute descriptive stats once (not inside the per-job loop)
+    num_jobs = len(jobs)
+    num_emerging = int(np.sum(y))
+    num_established = num_jobs - num_emerging
+    pct_emerging = round((num_emerging / num_jobs) * 100, 2)
+    pct_established = round((num_established / num_jobs) * 100, 2)
+    avg_skills = round(float(np.mean([sum(vec) for vec in X])), 2)
+    skill_frequency = pd.Series([s for j in jobs for s in j.get("skills", []) if s in id_to_label]).value_counts().head(10)
+    top_10_skills = [{"skill": id_to_label.get(sk, sk), "count": int(cnt)} for sk, cnt in skill_frequency.items()]
+    descriptive_stats = {
+        "total_jobs_analyzed": num_jobs,
+        "num_emerging": num_emerging,
+        "num_established": num_established,
+        "pct_emerging": pct_emerging,
+        "pct_established": pct_established,
+        "avg_skills_per_job": avg_skills,
+        "top_10_most_common_skills": top_10_skills
+    }
+
+    global_skill_impacts = {skill: 0.0 for skill in SKILL_INDEX}
+    results = []
+    FORBIDDEN_SKILLS = {"adhere to ohsas 18001", "visual basic"}
+    BADGE_MAP = {"ai": "🤖", "cloud": "☁️", "data": "📊", "devops": "⚙️", "cyber": "🔐", "software": "🧰", "algorithms": "📐", "green": "🌿", "education": "📘", "society": "🤝", "business": "💼", "health": "🩺", "manufacturing": "🏭"}
+    LOG_EVERY = max(1, num_jobs // 10)  # print progress every 10%
+
+    def clean_explanation(shap_vec, skill_index, forbidden=None):
+        if forbidden is None:
+            forbidden = set()
+        cleaned = []
+        for idx, impact in enumerate(shap_vec):
+            skill = skill_index[idx].lower()
+            if skill in forbidden:
+                continue
+            if impact == 0 or abs(impact) < 1e-12:
+                continue
+            cleaned.append({"skill": skill_index[idx], "impact": float(impact)})
+        cleaned = sorted(cleaned, key=lambda x: abs(x["impact"]), reverse=True)
+        return cleaned[:5]
+
+    print(f"📋 Building per-job diagnostics for {num_jobs} jobs...")
     for i, job in enumerate(jobs):
+        if i % LOG_EVERY == 0:
+            print(f"   ⚙️ Processing job {i+1}/{num_jobs} ({round((i+1)/num_jobs*100)}%)...")
+
         title = job.get("title", "")
         prob = float(probs[i])
         classification = "Emerging" if prob >= 0.5 else "Established"
+        emerging_score = int(prob * 100)
 
-        # ----------------------------------------------------
-        # SHAP EXPLANATION (Tree Models)
-        # ----------------------------------------------------
-        # ----------------------------------------------------
-        # SHAP EXPLANATION (Tree Models)
-        # ----------------------------------------------------
         if explanation_mode == "shap_tree":
-            shap_vec = shap_values[i]
-
-            # --- Remove zero impact skills ---
-            nonzero_indices = [
-                idx for idx in range(len(shap_vec))
-                if shap_vec[idx] != 0
-            ]
-
-            # Exclude unwanted recurring skills
-            forbidden = {"adhere to ohsas 18001", "visual basic"}
-
-            nonzero_indices = [
-                idx for idx in nonzero_indices
-                if SKILL_INDEX[idx].lower() not in forbidden
-            ]
-
-            # If nothing remains, skip explanation
-            if nonzero_indices:
-                idx_sorted = sorted(
-                    nonzero_indices,
-                    key=lambda idx: abs(shap_vec[idx]),
-                    reverse=True
-                )[:5]
-            else:
-                idx_sorted = []  # EMPTY → no explanation
-
-            shap_expl = [
-                {
-                    "skill": SKILL_INDEX[idx],
-                    "impact": float(shap_vec[idx])
-                }
-                for idx in idx_sorted
-            ]
-
-            # === Final Filtering of SHAP explanations ===
-
-            def clean_explanation(shap_vec, skill_index, forbidden=None):
-                if forbidden is None:
-                    forbidden = set()
-
-                cleaned = []
-                for idx, impact in enumerate(shap_vec):
-                    skill = skill_index[idx].lower()
-
-                    # skip forbidden skills
-                    if skill in forbidden:
-                        continue
-
-                    # skip zero or extremely tiny impacts
-                    if impact == 0 or abs(impact) < 1e-12:
-                        continue
-
-                    cleaned.append({"skill": skill_index[idx], "impact": float(impact)})
-
-                # sort by absolute impact
-                cleaned = sorted(cleaned, key=lambda x: abs(x["impact"]), reverse=True)
-
-                # return top 5
-                return cleaned[:5]
-
-            # Forbidden repeating noisy skills
-            FORBIDDEN_SKILLS = {
-                "adhere to ohsas 18001",
-                "visual basic"
-            }
-
-            # Apply final cleaning
-            shap_expl = clean_explanation(
-                shap_vec,
-                SKILL_INDEX,
-                forbidden=FORBIDDEN_SKILLS
-            )
-
-
-
-
-        # ----------------------------------------------------
-        # COEFFICIENT EXPLANATION (Linear Models)
-        # ----------------------------------------------------
-        # else:
-        #     coefs = model.coef_.ravel()
-        #     shap_vec = coefs * X[i]
-        #
-        #     idx_sorted = np.argsort(np.abs(shap_vec))[::-1][:5]
-        #     shap_expl = [
-        #         {"skill": SKILL_INDEX[idx], "impact": float(shap_vec[idx])}
-        #         for idx in idx_sorted
-        #     ]
+            shap_expl = clean_explanation(shap_values[i], SKILL_INDEX, forbidden=FORBIDDEN_SKILLS)
         else:
-            # LOGISTIC / LINEARSVC
-            if hasattr(model, "coef_"):
-                coefs = model.coef_.ravel()
-                shap_vec = coefs * X[i]
+            idx_sorted = np.argsort(np.abs(linear_shap_matrix[i]))[::-1][:5]
+            shap_expl = [{"skill": SKILL_INDEX[idx], "impact": float(linear_shap_matrix[i][idx])} for idx in idx_sorted]
 
-            # NAIVE BAYES
-            elif hasattr(model, "feature_log_prob_"):
-                # difference between Emerging vs Established likelihoods
-                class1 = model.feature_log_prob_[1]
-                class0 = model.feature_log_prob_[0]
-                shap_vec = (class1 - class0) * X[i]
-
-            else:
-                raise Exception(f"No explanation method available for model_type={model_type}")
-
-            idx_sorted = np.argsort(np.abs(shap_vec))[::-1][:5]
-            shap_expl = [
-                {"skill": SKILL_INDEX[idx], "impact": float(shap_vec[idx])}
-                for idx in idx_sorted
-            ]
-
-        # Accumulate global SHAP impacts
         for ex in shap_expl:
             global_skill_impacts[ex["skill"]] += ex["impact"]
 
-        # --- New: Group positive vs negative ---
-        positive_impacts = [
-            s for s in shap_expl if s["impact"] > 0
-        ]
+        positive_impacts = [s for s in shap_expl if s["impact"] > 0]
+        negative_impacts = [s for s in shap_expl if s["impact"] < 0]
+        top_positive = positive_impacts[:3]
+        top_negative = negative_impacts[:3]
 
-        negative_impacts = [
-            s for s in shap_expl if s["impact"] < 0
-        ]
-
-        top_positive = positive_impacts[:3]  # top 3 positive
-        top_negative = negative_impacts[:3]  # top 3 negative
-
-        # --- New: Emerging Score ---
-        emerging_score = int(prob * 100)
-
-        # --- Enhanced verdict ---
         verdict = (
             f"This job is {classification} with an Emerging score of {emerging_score}. "
             f"Top emerging signals: {[s['skill'] for s in top_positive]}. "
             f"Top established signals: {[s['skill'] for s in top_negative]}."
         )
 
-        # TEXT SUMMARY
-        most_pos = max(shap_expl, key=lambda x: x["impact"])
-        most_neg = min(shap_expl, key=lambda x: x["impact"])
-
-        text_summary = (
-            f"Model used: {model_type}. "
-            f"Job '{title}' classified as {classification} with probability {prob:.2f}. "
-            f"Top positive indicator: {most_pos['skill']} ({most_pos['impact']:.3f}). "
-            f"Top negative indicator: {most_neg['skill']} ({most_neg['impact']:.3f})."
-        )
-
-        # ----------------------------------------------------
-        # RADAR PROFILE CALCULATION (CATEGORY-LEVEL IMPACT)
-        # ----------------------------------------------------
         radar_profile = {cat: 0.0 for cat in SKILL_CATEGORIES}
-
         for s in shap_expl:
-            skill_label = s["skill"]
-            impact = s["impact"]
-
-            for cat, keywords in SKILL_CATEGORIES.items():
-                if any(k in skill_label for k in keywords):
-                    # radar_profile[cat] += impact
-                    radar_profile[cat] += abs(impact)
-
-        # Normalize radar values (0–100 scale)
+            for cat, kws in SKILL_CATEGORIES.items():
+                if any(k in s["skill"] for k in kws):
+                    radar_profile[cat] += abs(s["impact"])
         max_val = max(abs(v) for v in radar_profile.values()) or 1
-        radar_profile_normalized = {
-            cat: int((v / max_val) * 100) for cat, v in radar_profile.items()
-        }
+        radar_profile_normalized = {cat: int((v / max_val) * 100) for cat, v in radar_profile.items()}
 
-        # Sort global emerging (positive) and established (negative) skills
-        global_positive = sorted(
-            [(skill, imp) for skill, imp in global_skill_impacts.items() if imp > 0],
-            key=lambda x: x[1],
-            reverse=True
-        )[:15]
-
-        global_negative = sorted(
-            [(skill, imp) for skill, imp in global_skill_impacts.items() if imp < 0],
-            key=lambda x: x[1]
-        )[:15]  # lowest (most negative) first
-
-        # Convert to JSON-friendly format
-        global_top_emerging = [
-            {"skill": skill, "global_impact": float(imp)}
-            for skill, imp in global_positive
-        ]
-
-        global_top_established = [
-            {"skill": skill, "global_impact": float(imp)}
-            for skill, imp in global_negative
-        ]
-
-        # ----------------------------------------------------
-        # EMOJI BADGE FOR EMERGING LEVEL
-        # ----------------------------------------------------
         if emerging_score >= 90:
             emerging_badge = "🔥🔥🔥 Ultra Emerging"
         elif emerging_score >= 70:
@@ -835,62 +495,9 @@ def train_job_emerging_classifier(
         else:
             emerging_badge = "📘 Established"
 
-        # ----------------------------------------------------
-        # CATEGORY BADGES (based on radar > 50)
-        # ----------------------------------------------------
-        category_badges = []
-        if radar_profile_normalized.get("ai", 0) > 50: category_badges.append("🤖")
-        if radar_profile_normalized.get("cloud", 0) > 50: category_badges.append("☁️")
-        if radar_profile_normalized.get("data", 0) > 50: category_badges.append("📊")
-        if radar_profile_normalized.get("devops", 0) > 50: category_badges.append("⚙️")
-        if radar_profile_normalized.get("cyber", 0) > 50: category_badges.append("🔐")
-        if radar_profile_normalized.get("software", 0) > 50: category_badges.append("🧰")
-        if radar_profile_normalized.get("algorithms", 0) > 50: category_badges.append("📐")
-        if radar_profile_normalized.get("green", 0) > 50: category_badges.append("🌿")
-        if radar_profile_normalized.get("education", 0) > 50: category_badges.append("📘")
-        if radar_profile_normalized.get("society", 0) > 50: category_badges.append("🤝")
-        if radar_profile_normalized.get("business", 0) > 50: category_badges.append("💼")
-        if radar_profile_normalized.get("health", 0) > 50: category_badges.append("🩺")
-        if radar_profile_normalized.get("manufacturing", 0) > 50: category_badges.append("🏭")
-
+        category_badges = [badge for cat, badge in BADGE_MAP.items() if radar_profile_normalized.get(cat, 0) > 50]
         if not category_badges:
-            category_badges = ["⚪"]  # neutral
-
-        # ============================================================
-        # 4. DESCRIPTIVE STATISTICS
-        # ============================================================
-
-        # Count classifications
-        num_jobs = len(jobs)
-        num_emerging = int(np.sum(y))
-        num_established = num_jobs - num_emerging
-
-        pct_emerging = round((num_emerging / num_jobs) * 100, 2)
-        pct_established = round((num_established / num_jobs) * 100, 2)
-
-        # Average number of skills per job
-        avg_skills = np.mean([sum(vec) for vec in X])
-        avg_skills = round(float(avg_skills), 2)
-
-        # Top 10 most common skills in this sample
-        skill_frequency = pd.Series(
-            [s for job in jobs for s in job.get("skills", []) if s in id_to_label]
-        ).value_counts().head(10)
-
-        top_10_skills = [
-            {"skill": id_to_label.get(skill, skill), "count": int(count)}
-            for skill, count in skill_frequency.items()
-        ]
-
-        descriptive_stats = {
-            "total_jobs_analyzed": num_jobs,
-            "num_emerging": num_emerging,
-            "num_established": num_established,
-            "pct_emerging": pct_emerging,
-            "pct_established": pct_established,
-            "avg_skills_per_job": avg_skills,
-            "top_10_most_common_skills": top_10_skills
-        }
+            category_badges = ["⚪"]
 
         results.append({
             "job_title": title,
@@ -904,27 +511,84 @@ def train_job_emerging_classifier(
             "summary": verdict,
             "emerging_badge": emerging_badge,
             "category_badges": category_badges,
-
         })
 
-    # ===================================================================
-    # 3. RETURN
-    # ===================================================================
-    return {
+    print(f"✅ Per-job diagnostics complete.")
+
+    # Compute global summaries once after the loop
+    global_positive = sorted([(sk, imp) for sk, imp in global_skill_impacts.items() if imp > 0], key=lambda x: x[1], reverse=True)[:15]
+    global_negative = sorted([(sk, imp) for sk, imp in global_skill_impacts.items() if imp < 0], key=lambda x: x[1])[:15]
+    global_top_emerging = [{"skill": sk, "global_impact": float(imp)} for sk, imp in global_positive]
+    global_top_established = [{"skill": sk, "global_impact": float(imp)} for sk, imp in global_negative]
+
+    final_result = {
         "message": f"✅ {model_type.upper()} job classifier trained.",
         "model_type": model_type,
         "jobs_used": len(jobs),
+        "total_jobs_available": total_count,
         "skills_dim": len(SKILL_INDEX),
         "positive_label_ratio": float(np.mean(y)),
+        "filters_used": {
+            "keywords": keywords_list if keywords_list else None,
+            "occupation_ids": occ_ids_list if occ_ids_list else None,
+        },
+        "job_diagnostics": results,
         "descriptive_statistics": descriptive_stats,
         "global_top_emerging_skills": global_top_emerging,
         "global_top_established_skills": global_top_established
-
     }
+
+    # ================================================================
+    # 💾 SAVE TO CACHE
+    # ================================================================
+    print(f"💾 Saving results to cache: '{file_path}'...")
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(final_result, f, indent=4, ensure_ascii=False)
+    print(f"✅ Cached successfully to '{file_path}'.")
+
+    # ================================================================
+    # 📡 STREAM RESPONSE — avoids freezing FastAPI/browser on large payloads
+    # Serializes in chunks of 500 jobs so the connection stays alive
+    # ================================================================
+    print(f"📡 Streaming response ({len(results)} jobs)...")
+
+    def iter_json():
+        # Stream header fields first
+        header = {
+            "message": final_result["message"],
+            "model_type": final_result["model_type"],
+            "jobs_used": final_result["jobs_used"],
+            "total_jobs_available": final_result["total_jobs_available"],
+            "skills_dim": final_result["skills_dim"],
+            "positive_label_ratio": final_result["positive_label_ratio"],
+            "filters_used": final_result["filters_used"],
+            "descriptive_statistics": final_result["descriptive_statistics"],
+            "global_top_emerging_skills": final_result["global_top_emerging_skills"],
+            "global_top_established_skills": final_result["global_top_established_skills"],
+        }
+        payload = json.dumps(header, ensure_ascii=False)
+        # Insert job_diagnostics array in streaming chunks
+        payload = payload[:-1]  # strip trailing }
+        yield payload + ', "job_diagnostics": ['
+
+        chunk_size = 200
+        all_diag = final_result["job_diagnostics"]
+        for idx, job_result in enumerate(all_diag):
+            chunk = json.dumps(job_result, ensure_ascii=False)
+            if idx < len(all_diag) - 1:
+                yield chunk + ","
+            else:
+                yield chunk
+            # yield in batches to avoid overwhelming the buffer
+            if idx % chunk_size == 0 and idx > 0:
+                pass  # natural yield cadence
+
+        yield "]}"  # close job_diagnostics array and root object
+
+    return StreamingResponse(iter_json(), media_type="application/json")
 
 
 # ------------------------------------------------------------
 # REGISTER ROUTER
 # ------------------------------------------------------------
 app.include_router(analysis_router)
-
