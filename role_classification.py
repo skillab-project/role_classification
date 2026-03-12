@@ -385,11 +385,10 @@ def train_job_emerging_classifier(
     # ================================================================
     # PREDICT + SHAP — ✅ FIX 2: chunked SHAP to avoid single huge allocation
     # ================================================================
-    update("running", f"Running predictions on {num_jobs} jobs...")
+    print(f"📋 Running predictions on {num_jobs} jobs...")
     if model_type_lower in ["xgboost", "random_forest"]:
         probs = model.predict_proba(X)[:, 1]
 
-        update("running", f"Computing SHAP values in chunks...")
         print(f"🧠 Computing SHAP values for {X.shape[0]} jobs x {X.shape[1]} skills (chunked)...")
 
         SHAP_CHUNK = 10_000  # ✅ process 10k rows at a time instead of all 535k at once
@@ -454,7 +453,7 @@ def train_job_emerging_classifier(
     # ================================================================
     # PER-JOB DIAGNOSTICS
     # ================================================================
-    update("running", f"Building per-job diagnostics for {num_jobs} jobs...")
+    print(f"📋 Building per-job diagnostics for {num_jobs} jobs...")
 
     FORBIDDEN_SKILLS = {"adhere to ohsas 18001", "visual basic"}
     BADGE_MAP = {"ai": "🤖", "cloud": "☁️", "data": "📊", "devops": "⚙️", "cyber": "🔐", "software": "🧰", "algorithms": "📐", "green": "🌿", "education": "📘", "society": "🤝", "business": "💼", "health": "🩺", "manufacturing": "🏭"}
