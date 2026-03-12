@@ -2,6 +2,8 @@ import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import patch, MagicMock
 import numpy as np
+import os
+from pathlib import Path
 
 # Import the app
 from role_classification import app
