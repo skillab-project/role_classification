@@ -346,7 +346,11 @@ def train_job_emerging_classifier(
     model_type_lower = model_type.lower()
 
     if model_type_lower == "xgboost":
-        model = xgb.XGBClassifier(n_estimators=120, max_depth=5, learning_rate=0.08, subsample=0.8, colsample_bytree=0.8, eval_metric="logloss")
+        model = xgb.XGBClassifier(
+            n_estimators=120, max_depth=5, learning_rate=0.08,
+            subsample=0.8, colsample_bytree=0.8, eval_metric="logloss",
+            tree_method="hist",
+        )
         model.fit(X, y)
         JOB_MODEL = model
         EXPLAINER = shap.TreeExplainer(model)
@@ -379,14 +383,32 @@ def train_job_emerging_classifier(
         return {"error": "Invalid model_type. Choose: xgboost, random_forest, logistic, svm, naive_bayes"}
 
     # ================================================================
-    # PREDICT + SHAP (computed once on full matrix, not per-job)
+    # PREDICT + SHAP — ✅ FIX 2: chunked SHAP to avoid single huge allocation
     # ================================================================
-    print(f"🔮 Running predictions on {len(jobs)} jobs...")
+    update("running", f"Running predictions on {num_jobs} jobs...")
     if model_type_lower in ["xgboost", "random_forest"]:
         probs = model.predict_proba(X)[:, 1]
-        print(f"🧠 Computing SHAP values for {X.shape[0]} jobs x {X.shape[1]} skills...")
-        print(f"   ⏳ Using approximate=True for speed (10-50x faster, near-identical results)...")
-        shap_values = EXPLAINER.shap_values(X, approximate=True, check_additivity=False)
+
+        update("running", f"Computing SHAP values in chunks...")
+        print(f"🧠 Computing SHAP values for {X.shape[0]} jobs x {X.shape[1]} skills (chunked)...")
+
+        SHAP_CHUNK = 10_000  # ✅ process 10k rows at a time instead of all 535k at once
+        shap_values_list = []
+        total_chunks = math.ceil(num_jobs / SHAP_CHUNK)
+        for chunk_i in range(total_chunks):
+            start = chunk_i * SHAP_CHUNK
+            end = min(start + SHAP_CHUNK, num_jobs)
+            print(f"   SHAP chunk {chunk_i + 1}/{total_chunks}: rows {start}–{end}...")
+            sv = EXPLAINER.shap_values(
+                X[start:end],
+                approximate=True,
+                check_additivity=False
+            )
+            # For binary XGBoost, sv may be 2D array directly
+            if isinstance(sv, list):
+                sv = sv[1]  # class 1
+            shap_values_list.append(sv)
+        shap_values = np.vstack(shap_values_list)
         print(f"✅ SHAP computation complete.")
     else:
         if hasattr(model, "predict_proba"):
@@ -396,25 +418,28 @@ def train_job_emerging_classifier(
             probs = 1 / (1 + np.exp(-decision))
         shap_values = None
 
-    # Precompute linear explanation vectors once (not per-job)
+    # Precompute linear explanation vectors once
+    linear_shap_matrix = None
     if explanation_mode == "linear_coef":
         if hasattr(model, "coef_"):
             coefs = model.coef_.ravel()
-            linear_shap_matrix = X * coefs  # shape: (n_jobs, n_skills)
+            linear_shap_matrix = X.toarray() * coefs
         elif hasattr(model, "feature_log_prob_"):
             diff = model.feature_log_prob_[1] - model.feature_log_prob_[0]
-            linear_shap_matrix = X * diff
+            linear_shap_matrix = X.toarray() * diff
         else:
             raise Exception(f"No explanation method available for model_type={model_type}")
 
-    # Precompute descriptive stats once (not inside the per-job loop)
-    num_jobs = len(jobs)
+    # ================================================================
+    # DESCRIPTIVE STATS
+    # ================================================================
     num_emerging = int(np.sum(y))
     num_established = num_jobs - num_emerging
     pct_emerging = round((num_emerging / num_jobs) * 100, 2)
     pct_established = round((num_established / num_jobs) * 100, 2)
-    avg_skills = round(float(np.mean([sum(vec) for vec in X])), 2)
-    skill_frequency = pd.Series([s for j in jobs for s in j.get("skills", []) if s in id_to_label]).value_counts().head(10)
+    # Dense row-sum is fine here since it's just a 1D vector
+    avg_skills = round(float(np.mean(np.asarray(X.sum(axis=1)).ravel())), 2)
+    skill_frequency = pd.Series(all_skill_ids).value_counts().head(10)
     top_10_skills = [{"skill": id_to_label.get(sk, sk), "count": int(cnt)} for sk, cnt in skill_frequency.items()]
     descriptive_stats = {
         "total_jobs_analyzed": num_jobs,
@@ -426,11 +451,17 @@ def train_job_emerging_classifier(
         "top_10_most_common_skills": top_10_skills
     }
 
-    global_skill_impacts = {skill: 0.0 for skill in SKILL_INDEX}
-    results = []
+    # ================================================================
+    # PER-JOB DIAGNOSTICS
+    # ================================================================
+    update("running", f"Building per-job diagnostics for {num_jobs} jobs...")
+
     FORBIDDEN_SKILLS = {"adhere to ohsas 18001", "visual basic"}
     BADGE_MAP = {"ai": "🤖", "cloud": "☁️", "data": "📊", "devops": "⚙️", "cyber": "🔐", "software": "🧰", "algorithms": "📐", "green": "🌿", "education": "📘", "society": "🤝", "business": "💼", "health": "🩺", "manufacturing": "🏭"}
-    LOG_EVERY = max(1, num_jobs // 10)  # print progress every 10%
+    LOG_EVERY = max(1, num_jobs // 10)
+
+    global_skill_impacts = {skill: 0.0 for skill in SKILL_INDEX}
+    results = []
 
     def clean_explanation(shap_vec, skill_index, forbidden=None):
         if forbidden is None:
