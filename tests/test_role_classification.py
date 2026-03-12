@@ -8,11 +8,25 @@ from role_classification import app
 
 client = TestClient(app)
 
+@pytest.fixture(autouse=True)
+def cleanup_completed_analyses():
+    """Delete any cache files created under Completed_Analyses/ during each test."""
+    folder = Path("Completed_Analyses")
+    files_before = set(folder.glob("*.json")) if folder.exists() else set()
+ 
+    yield
+ 
+    if folder.exists():
+        files_after = set(folder.glob("*.json"))
+        for new_file in files_after - files_before:
+            new_file.unlink()
+
 # ==========================================
 # 1. MOCK DATA
 # ==========================================
 
 MOCK_JOBS_RESPONSE = {
+    "count": 4,
     "items": [
         {
             "title": "AI Research Scientist",
@@ -53,8 +67,8 @@ def test_train_emerging_classifier_xgboost(mock_post):
     
     # Mocking sequence of API calls:
     # 1. Login
-    # 2. Jobs Page 1
-    # 3. Skills Page 1
+    # 2. Jobs Page 1 (probe + subsequent pages)
+    # 3. Skills (batched)
     
     mock_login = MagicMock()
     mock_login.text = '"fake_token"'
@@ -68,8 +82,7 @@ def test_train_emerging_classifier_xgboost(mock_post):
     mock_skills.json.return_value = MOCK_SKILLS_RESPONSE
     mock_skills.status_code = 200
     
-    # We provide enough responses for the loops in the code
-    # Code fetches max_pages of jobs and 40 pages of skills
+    # Provide enough responses for the loops in the code
     mock_post.side_effect = [mock_login] + [mock_jobs]*8 + [mock_skills]*40
 
     response = client.post("/api/analysis/jobs_emergingdck_train?keywords=ai,data&model_type=xgboost")
@@ -90,10 +103,15 @@ def test_train_emerging_classifier_logistic(mock_post):
     
     mock_login = MagicMock()
     mock_login.text = '"token"'
+    mock_login.status_code = 200
+    
     mock_jobs = MagicMock()
     mock_jobs.json.return_value = MOCK_JOBS_RESPONSE
+    mock_jobs.status_code = 200
+    
     mock_skills = MagicMock()
     mock_skills.json.return_value = MOCK_SKILLS_RESPONSE
+    mock_skills.status_code = 200
     
     mock_post.side_effect = [mock_login] + [mock_jobs]*8 + [mock_skills]*40
 
@@ -109,8 +127,11 @@ def test_no_jobs_found(mock_post):
     
     mock_login = MagicMock()
     mock_login.text = '"token"'
+    mock_login.status_code = 200
+    
     mock_jobs = MagicMock()
-    mock_jobs.json.return_value = {"items": []} # Empty list
+    mock_jobs.json.return_value = {"count": 0, "items": []}
+    mock_jobs.status_code = 200
     
     mock_post.side_effect = [mock_login, mock_jobs]
 
@@ -118,7 +139,7 @@ def test_no_jobs_found(mock_post):
     
     assert response.status_code == 200
     assert "error" in response.json()
-    assert response.json()["error"] == "No jobs found"
+    assert response.json()["error"] == "No jobs found for the given filters."
 
 def test_invalid_model_type():
     """Verify validation for model_type parameter."""
