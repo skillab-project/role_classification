@@ -59,19 +59,8 @@ MOCK_SKILLS_RESPONSE = {
     ]
 }
 
-# ==========================================
-# 2. TESTS
-# ==========================================
-
-@patch("requests.post")
-def test_train_emerging_classifier_xgboost(mock_post):
-    """Test full training pipeline using XGBoost (Default)."""
-    
-    # Mocking sequence of API calls:
-    # 1. Login
-    # 2. Jobs Page 1 (probe + subsequent pages)
-    # 3. Skills (batched)
-    
+def get_mock_setup():
+    """Helper to create standard mock responses."""
     mock_login = MagicMock()
     mock_login.text = '"fake_token"'
     mock_login.status_code = 200
@@ -83,6 +72,19 @@ def test_train_emerging_classifier_xgboost(mock_post):
     mock_skills = MagicMock()
     mock_skills.json.return_value = MOCK_SKILLS_RESPONSE
     mock_skills.status_code = 200
+    
+    return mock_login, mock_jobs, mock_skills
+
+
+# ==========================================
+# 2. TESTS
+# ==========================================
+
+@patch("requests.post")
+def test_train_emerging_classifier_xgboost(mock_post):
+    """Test full training pipeline using XGBoost (Default)."""
+    
+    mock_login, mock_jobs, mock_skills = get_mock_setup()
     
     # Provide enough responses for the loops in the code
     mock_post.side_effect = [mock_login] + [mock_jobs]*8 + [mock_skills]*40
@@ -103,17 +105,7 @@ def test_train_emerging_classifier_xgboost(mock_post):
 def test_train_emerging_classifier_logistic(mock_post):
     """Test the Logistic Regression path (uses coefficients instead of SHAP)."""
     
-    mock_login = MagicMock()
-    mock_login.text = '"token"'
-    mock_login.status_code = 200
-    
-    mock_jobs = MagicMock()
-    mock_jobs.json.return_value = MOCK_JOBS_RESPONSE
-    mock_jobs.status_code = 200
-    
-    mock_skills = MagicMock()
-    mock_skills.json.return_value = MOCK_SKILLS_RESPONSE
-    mock_skills.status_code = 200
+    mock_login, mock_jobs, mock_skills = get_mock_setup()
     
     mock_post.side_effect = [mock_login] + [mock_jobs]*8 + [mock_skills]*40
 
@@ -143,9 +135,12 @@ def test_no_jobs_found(mock_post):
     assert "error" in response.json()
     assert response.json()["error"] == "No jobs found for the given filters."
 
-def test_invalid_model_type():
+@patch("requests.post")
+def test_invalid_model_type(mock_post):
     """Verify validation for model_type parameter."""
-    # Note: We don't need to patch requests here because validation happens before API calls
+    mock_login, mock_jobs, mock_skills = get_mock_setup()
+    mock_post.side_effect = [mock_login, mock_jobs, mock_skills]
+
     response = client.post("/api/analysis/jobs_emergingdck_train?keywords=ai&model_type=brain_waves")
     
     assert response.status_code == 200
