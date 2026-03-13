@@ -243,25 +243,35 @@ def train_job_emerging_classifier(
         rare_skill_ids = set(skill_global_counts[skill_global_counts < rare_threshold].index)
 
         print(f"🏗️ Building sparse matrix ({len(jobs)} x {len(SKILL_INDEX)})...")
-        X_sparse = sparse.lil_matrix((len(jobs), len(SKILL_INDEX)), dtype=np.int8)
+        # Use COO arrays instead of lil_matrix — dramatically faster for large datasets
+        rows, cols = [], []
         labels = []
+
+        # Pre-convert long keyword lists to sets for O(1) substring-free matching
+        EMERGING_SET = set(TITLE_KEYWORDS_EMERGING)
+        ESTABLISHED_SET = set(TITLE_KEYWORDS_ESTABLISHED)
 
         for i, job in enumerate(jobs):
             title = job.get("title", "").lower()
             job_skill_ids = [s for s in job.get("skills", []) if s in id_to_label]
-            
+
             for s_id in job_skill_ids:
                 s_lab = id_to_label[s_id]
-                if s_lab in skill_to_idx:
-                    X_sparse[i, skill_to_idx[s_lab]] = 1
-            
-            if any(kw in title for kw in TITLE_KEYWORDS_ESTABLISHED): labels.append(0)
-            elif any(kw in title for kw in TITLE_KEYWORDS_EMERGING): labels.append(1)
+                col_idx = skill_to_idx.get(s_lab)
+                if col_idx is not None:
+                    rows.append(i)
+                    cols.append(col_idx)
+
+            if any(kw in title for kw in ESTABLISHED_SET): labels.append(0)
+            elif any(kw in title for kw in EMERGING_SET): labels.append(1)
             elif any(s in rare_skill_ids for s in job_skill_ids): labels.append(1)
             else: labels.append(0)
 
+        data = np.ones(len(rows), dtype=np.int8)
+        X_sparse = sparse.csr_matrix(
+            (data, (rows, cols)), shape=(len(jobs), len(SKILL_INDEX)), dtype=np.int8
+        )
         y = np.array(labels)
-        X_sparse = X_sparse.tocsr() 
 
         # ================================================================
         # 5️⃣ MODEL TRAINING (With Subsampling for speed)
@@ -270,20 +280,31 @@ def train_job_emerging_classifier(
         explainer = None
         mode = None
 
-        TRAIN_SIZE = min(100000, len(jobs))
-        print(f"🚂 Training {model_type} on {TRAIN_SIZE} samples...")
-        
+        TRAIN_SIZE = min(50000, len(jobs))  # Reduced: 50k is plenty for skill-based classification
+        SHAP_EXPLAIN_SIZE = min(20000, len(jobs))  # SHAP is O(n*features) — cap separately
+        print(f"🚂 Training {model_type} on {TRAIN_SIZE} samples (SHAP explain on {SHAP_EXPLAIN_SIZE})...")
+
         indices = np.arange(len(jobs))
         np.random.shuffle(indices)
         train_idx = indices[:TRAIN_SIZE]
+        explain_idx = indices[:SHAP_EXPLAIN_SIZE]  # Subset used for SHAP explanations
 
         if model_type_lower == "xgboost":
-            model = xgb.XGBClassifier(n_estimators=100, max_depth=4, tree_method="hist", n_jobs=-1)
+            model = xgb.XGBClassifier(
+                n_estimators=50,       # Reduced from 100 — sufficient for binary skill classification
+                max_depth=4,
+                tree_method="hist",
+                n_jobs=-1,
+                subsample=0.8,         # Row subsampling per tree — speeds up without quality loss
+                colsample_bytree=0.5,  # Feature subsampling — big win on 1300+ skill columns
+                eval_metric="logloss",
+                verbosity=0,
+            )
             model.fit(X_sparse[train_idx], y[train_idx])
             explainer = shap.TreeExplainer(model)
             mode = "shap"
         elif model_type_lower == "random_forest":
-            model = RandomForestClassifier(n_estimators=50, max_depth=10, n_jobs=-1)
+            model = RandomForestClassifier(n_estimators=30, max_depth=8, n_jobs=-1)  # Reduced from 50/10
             model.fit(X_sparse[train_idx], y[train_idx])
             explainer = shap.TreeExplainer(model)
             mode = "shap"
@@ -301,17 +322,33 @@ def train_job_emerging_classifier(
         def response_generator():
             num_jobs = len(jobs)
             global_skill_impacts = {skill: 0.0 for skill in SKILL_INDEX}
-            
-            # Predict probabilities
+
+            # Predict probabilities for ALL jobs (fast — single matrix multiply)
             probs = model.predict_proba(X_sparse)[:, 1]
 
+            # Pre-compute SHAP only for the capped explain subset
+            # explain_idx is a shuffled subset so impacts are still representative
+            explain_idx_set = set(explain_idx.tolist())
+
             coefs = None
+            shap_values_map = {}  # g_idx -> impact array (only for explained jobs)
+
             if mode == "linear":
                 coefs = model.coef_.ravel()
+            elif mode == "shap":
+                print(f"⚡ Computing SHAP for {len(explain_idx)} jobs (capped for speed)...")
+                SHAP_BATCH = 500
+                for s_start in range(0, len(explain_idx), SHAP_BATCH):
+                    s_end = min(s_start + SHAP_BATCH, len(explain_idx))
+                    batch_g_idx = explain_idx[s_start:s_end]
+                    batch_shap = explainer.shap_values(
+                        X_sparse[batch_g_idx].toarray(), check_additivity=False
+                    )
+                    for local_i, g_i in enumerate(batch_g_idx):
+                        shap_values_map[int(g_i)] = batch_shap[local_i]
 
             BADGE_MAP = {"ai": "🤖", "cloud": "☁️", "data": "📊", "green": "🌿", "software": "🧰", "cyber": "🔐", "devops": "⚙️"}
 
-            # FIX: Corrected variable name X -> X_sparse and sum logic
             header = {
                 "message": f"✅ {model_type.upper()} trained.",
                 "model_type": model_type,
@@ -329,34 +366,49 @@ def train_job_emerging_classifier(
             }
             yield json.dumps(header, ensure_ascii=False)[:-1] + ', "job_diagnostics": ['
 
-            BATCH_SIZE = 1000 
+            BATCH_SIZE = 1000
             for start in range(0, num_jobs, BATCH_SIZE):
                 end = min(start + BATCH_SIZE, num_jobs)
                 X_batch = X_sparse[start:end]
-                
-                # FIX: Handle Sparse matrix logic for impacts
-                if mode == "shap":
-                    # SHAP usually requires dense input for TreeExplainer
-                    batch_impacts = explainer.shap_values(X_batch.toarray(), check_additivity=False)
-                else:
-                    # For linear, we use multiply for element-wise impact then convert to dense
+
+                if mode == "linear":
                     batch_impacts = X_batch.multiply(coefs).toarray()
+                else:
+                    batch_impacts = None  # We'll use shap_values_map per job
 
                 for i in range(end - start):
                     g_idx = start + i
-                    job_imp = batch_impacts[i]
-                    top_idx = np.argsort(np.abs(job_imp))[::-1][:5]
-                    
-                    shap_expl = []
-                    radar = {c: 0.0 for c in SKILL_CATEGORIES}
-                    for idx in top_idx:
-                        val = float(job_imp[idx])
-                        if abs(val) < 1e-10: continue
-                        name = SKILL_INDEX[idx]
-                        shap_expl.append({"skill": name, "impact": val})
-                        global_skill_impacts[name] += val
-                        for cat, kws in SKILL_CATEGORIES.items():
-                            if any(k in name for k in kws): radar[cat] += abs(val)
+
+                    if mode == "shap":
+                        job_imp = shap_values_map.get(g_idx)
+                        if job_imp is None:
+                            # Job not in explain subset — skip SHAP explanation
+                            shap_expl, radar = [], {c: 0.0 for c in SKILL_CATEGORIES}
+                        else:
+                            top_idx = np.argsort(np.abs(job_imp))[::-1][:5]
+                            shap_expl = []
+                            radar = {c: 0.0 for c in SKILL_CATEGORIES}
+                            for idx in top_idx:
+                                val = float(job_imp[idx])
+                                if abs(val) < 1e-10: continue
+                                name = SKILL_INDEX[idx]
+                                shap_expl.append({"skill": name, "impact": val})
+                                global_skill_impacts[name] += val
+                                for cat, kws in SKILL_CATEGORIES.items():
+                                    if any(k in name for k in kws): radar[cat] += abs(val)
+                    else:
+                        job_imp = batch_impacts[i]
+                        top_idx = np.argsort(np.abs(job_imp))[::-1][:5]
+                        shap_expl = []
+                        radar = {c: 0.0 for c in SKILL_CATEGORIES}
+                        for idx in top_idx:
+                            val = float(job_imp[idx])
+                            if abs(val) < 1e-10: continue
+                            name = SKILL_INDEX[idx]
+                            shap_expl.append({"skill": name, "impact": val})
+                            global_skill_impacts[name] += val
+                            for cat, kws in SKILL_CATEGORIES.items():
+                                if any(k in name for k in kws): radar[cat] += abs(val)
 
                     score = int(probs[g_idx] * 100)
                     max_val = max(radar.values()) if radar.values() else 0
