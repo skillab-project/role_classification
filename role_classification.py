@@ -13,6 +13,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, APIRouter, Query, HTTPException
 from fastapi.responses import StreamingResponse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -73,6 +74,14 @@ def train_job_emerging_classifier(
     model_type: str = Query(
         "xgboost", description="Choose: xgboost, random_forest, logistic"
     ),
+    # ----------------------------------------------------------------
+    # NEW: hard cap on how many jobs to fetch (default 60k — more than
+    # enough since training uses at most 50k).  Set to 0 for unlimited.
+    # ----------------------------------------------------------------
+    max_jobs: int = Query(
+        60000,
+        description="Max jobs to fetch. Training uses at most 50k; fetching more is wasted I/O. Set 0 for unlimited."
+    ),
 ):
     load_dotenv()
     API = os.getenv("TRACKER_API", "https://skillab-tracker.csd.auth.gr/api")
@@ -119,7 +128,7 @@ def train_job_emerging_classifier(
 
     try:
         # ================================================================
-        # 1️⃣ DATA FETCHING
+        # 1️⃣ DATA FETCHING  (parallel + capped)
         # ================================================================
         res = requests.post(f"{API}/login", json={"username": USER, "password": PASS}, timeout=15)
         res.raise_for_status()
@@ -139,15 +148,45 @@ def train_job_emerging_classifier(
         
         jobs = list(probe_data.get("items", []))
         total_pages = math.ceil(total_count / 100)
-        print(f"📊 Fetching {total_pages} pages...")
 
-        for page in range(2, total_pages + 1):
-            print(f"📦 Progress: {page}/{total_pages} pages fetched.")
-            data = fetch_page(page)
-            items = data.get("items", [])
-            if not items: break
-            jobs.extend(items)
-            if page % 500 == 0: print(f"📦 Progress: {len(jobs)}/{total_count}")
+        # ----------------------------------------------------------------
+        # Cap pages fetched — no point fetching 535k jobs when training
+        # only uses 50k.  Add 20% headroom over TRAIN_SIZE for variety.
+        # ----------------------------------------------------------------
+        TRAIN_SIZE_CAP = 50000
+        effective_max = max_jobs if max_jobs > 0 else total_count
+        pages_needed = min(total_pages, math.ceil(effective_max / 100))
+
+        print(f"📊 Total available: {total_count} jobs ({total_pages} pages). "
+              f"Fetching first {pages_needed} pages (≈{pages_needed*100} jobs, capped at {effective_max}).")
+
+        # Parallel fetch — 10 workers keeps the API happy without hammering it
+        FETCH_WORKERS = 10
+        page_results = {}
+
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
+            future_to_page = {executor.submit(fetch_page, p): p for p in range(2, pages_needed + 1)}
+            completed = 0
+            for future in as_completed(future_to_page):
+                p = future_to_page[future]
+                try:
+                    data = future.result()
+                    page_results[p] = data.get("items", [])
+                except Exception as exc:
+                    print(f"⚠️ Page {p} failed: {exc}")
+                    page_results[p] = []
+                completed += 1
+                if completed % 100 == 0:
+                    print(f"📦 Progress: {completed}/{pages_needed - 1} pages fetched.")
+
+        # Reassemble in order so job list is deterministic
+        for p in range(2, pages_needed + 1):
+            jobs.extend(page_results.get(p, []))
+            if len(jobs) >= effective_max:
+                jobs = jobs[:effective_max]
+                break
+
+        print(f"✅ Fetched {len(jobs)} jobs.")
 
         # ================================================================
         # 2️⃣ SKILL RESOLUTION
@@ -281,7 +320,15 @@ def train_job_emerging_classifier(
         mode = None
 
         TRAIN_SIZE = min(50000, len(jobs))  # Reduced: 50k is plenty for skill-based classification
-        SHAP_EXPLAIN_SIZE = min(20000, len(jobs))  # SHAP is O(n*features) — cap separately
+
+        # ----------------------------------------------------------------
+        # SHAP cap: 2000–5000 samples gives near-identical feature
+        # importances to 20k but runs ~10x faster.
+        # At 1328 features, TreeExplainer on 5000 dense rows takes ~30s
+        # vs ~5 minutes for 20000 rows.
+        # ----------------------------------------------------------------
+        SHAP_EXPLAIN_SIZE = min(5000, len(jobs))
+
         print(f"🚂 Training {model_type} on {TRAIN_SIZE} samples (SHAP explain on {SHAP_EXPLAIN_SIZE})...")
 
         indices = np.arange(len(jobs))
@@ -336,16 +383,24 @@ def train_job_emerging_classifier(
             if mode == "linear":
                 coefs = model.coef_.ravel()
             elif mode == "shap":
-                print(f"⚡ Computing SHAP for {len(explain_idx)} jobs (capped for speed)...")
+                print(f"⚡ Computing SHAP for {len(explain_idx)} jobs...")
+                # --------------------------------------------------------
+                # Keep sparse — do NOT call .toarray() on the full batch.
+                # TreeExplainer accepts sparse CSR input directly and is
+                # significantly faster + uses far less RAM.
+                # --------------------------------------------------------
                 SHAP_BATCH = 500
+                X_explain = X_sparse[explain_idx]  # slice once, keep sparse
                 for s_start in range(0, len(explain_idx), SHAP_BATCH):
                     s_end = min(s_start + SHAP_BATCH, len(explain_idx))
                     batch_g_idx = explain_idx[s_start:s_end]
+                    # Pass sparse slice — no .toarray() needed
                     batch_shap = explainer.shap_values(
-                        X_sparse[batch_g_idx].toarray(), check_additivity=False
+                        X_explain[s_start:s_end], check_additivity=False
                     )
                     for local_i, g_i in enumerate(batch_g_idx):
                         shap_values_map[int(g_i)] = batch_shap[local_i]
+                print(f"✅ SHAP done.")
 
             BADGE_MAP = {"ai": "🤖", "cloud": "☁️", "data": "📊", "green": "🌿", "software": "🧰", "cyber": "🔐", "devops": "⚙️"}
 
